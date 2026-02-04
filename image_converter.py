@@ -143,6 +143,116 @@ def convert_image(source: Image.Image, matcher: PaletteMatcher) -> Image.Image:
     return result
 
 
+def select_best_colors_for_scanline(source: Image.Image, y: int,
+                                     palette: List[Color], max_colors: int) -> List[int]:
+    """
+    Select the best N palette colors for a single scanline.
+    Uses weighted color frequency and error minimization.
+    """
+    width = source.size[0]
+    pixels = source.load()
+
+    # Collect all unique colors in this scanline with their counts
+    color_counts = {}
+    for x in range(width):
+        rgb = pixels[x, y]
+        color_counts[rgb] = color_counts.get(rgb, 0) + 1
+
+    # For each unique source color, find best palette match and track error
+    palette_usage = {}  # palette_idx -> (total_weighted_error, count)
+    color_to_palette = {}  # source_rgb -> palette_idx
+
+    for rgb, count in color_counts.items():
+        r, g, b = rgb
+        source_lab = rgb_to_oklab(r, g, b)
+
+        # Find best palette color
+        best_idx = 0
+        best_dist = float('inf')
+
+        for idx, pal_color in enumerate(palette):
+            pal_lab = rgb_to_oklab(pal_color.r, pal_color.g, pal_color.b)
+            dist = oklab_distance(source_lab, pal_lab)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+
+        color_to_palette[rgb] = best_idx
+
+        if best_idx not in palette_usage:
+            palette_usage[best_idx] = {'count': 0, 'weighted_importance': 0}
+        palette_usage[best_idx]['count'] += count
+        # Weight by count and inverse of error (colors with low error and high count are important)
+        palette_usage[best_idx]['weighted_importance'] += count * (1.0 / (best_dist + 0.001))
+
+    # If we already have <= max_colors, we're done
+    if len(palette_usage) <= max_colors:
+        return list(palette_usage.keys())
+
+    # Otherwise, select the most important colors
+    sorted_colors = sorted(
+        palette_usage.items(),
+        key=lambda x: x[1]['weighted_importance'],
+        reverse=True
+    )
+
+    return [idx for idx, _ in sorted_colors[:max_colors]]
+
+
+def convert_image_scanline_limited(source: Image.Image, palette: List[Color],
+                                    colors_per_scanline: int = 16) -> Image.Image:
+    """
+    Convert an image with a limit on colors per scanline (VIC-II style).
+
+    For each scanline:
+    1. Analyze which palette colors best represent that line
+    2. Select the best N colors for that scanline
+    3. Map each pixel to only those N colors
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    width, height = source.size
+    result = Image.new('RGB', (width, height))
+
+    source_pixels = source.load()
+    result_pixels = result.load()
+
+    # Pre-compute OKLab values for palette
+    palette_oklab = [rgb_to_oklab(c.r, c.g, c.b) for c in palette]
+
+    for y in range(height):
+        # Select best colors for this scanline
+        scanline_palette_indices = select_best_colors_for_scanline(
+            source, y, palette, colors_per_scanline
+        )
+
+        # Build a mini-matcher for just these colors
+        scanline_palette = [palette[i] for i in scanline_palette_indices]
+        scanline_oklab = [palette_oklab[i] for i in scanline_palette_indices]
+
+        # Convert each pixel in this scanline
+        for x in range(width):
+            r, g, b = source_pixels[x, y]
+            source_lab = rgb_to_oklab(r, g, b)
+
+            # Find nearest from scanline palette
+            best_local_idx = 0
+            best_dist = float('inf')
+
+            for local_idx, pal_lab in enumerate(scanline_oklab):
+                dist = oklab_distance(source_lab, pal_lab)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_local_idx = local_idx
+
+            # Get the color
+            pal_color = scanline_palette[best_local_idx]
+            result_pixels[x, y] = (pal_color.r, pal_color.g, pal_color.b)
+
+    return result
+
+
 def create_comparison_image(source: Image.Image, converted_images: List[Tuple[str, Image.Image]],
                             max_width: int = 1920) -> Image.Image:
     """Create a side-by-side comparison image"""
@@ -208,14 +318,24 @@ def create_comparison_image(source: Image.Image, converted_images: List[Tuple[st
     return output
 
 
-def convert_with_all_palettes(source_path: str, output_dir: str = None):
-    """Convert an image using all available palettes"""
+def convert_with_all_palettes(source_path: str, output_dir: str = None,
+                               scanline_limit: int = None):
+    """
+    Convert an image using all available palettes.
+
+    Args:
+        source_path: Path to source image
+        output_dir: Output directory (default: same as source)
+        scanline_limit: Max colors per scanline (VIC-II mode), None for unlimited
+    """
 
     # Load source image
     print(f"Loading: {source_path}")
     source = Image.open(source_path)
     print(f"  Size: {source.size[0]}x{source.size[1]}")
     print(f"  Mode: {source.mode}")
+    if scanline_limit:
+        print(f"  Scanline limit: {scanline_limit} colors per line")
 
     # Determine output directory
     source_path = Path(source_path)
@@ -239,19 +359,27 @@ def convert_with_all_palettes(source_path: str, output_dir: str = None):
 
     for name, palette in palettes:
         print(f"Converting with {name}...")
-        matcher = PaletteMatcher(palette)
-        converted = convert_image(source, matcher)
+
+        if scanline_limit:
+            converted = convert_image_scanline_limited(source, palette, scanline_limit)
+            suffix = f"_{name}_sl{scanline_limit}"
+        else:
+            matcher = PaletteMatcher(palette)
+            converted = convert_image(source, matcher)
+            suffix = f"_{name}"
+
         converted_images.append((name, converted))
 
         # Save individual converted image
-        out_path = output_dir / f"{source_path.stem}_{name}.png"
+        out_path = output_dir / f"{source_path.stem}{suffix}.png"
         converted.save(out_path)
         print(f"  Saved: {out_path}")
 
     # Create comparison image
     print("Creating comparison image...")
     comparison = create_comparison_image(source, converted_images)
-    comparison_path = output_dir / f"{source_path.stem}_comparison.png"
+    sl_suffix = f"_sl{scanline_limit}" if scanline_limit else ""
+    comparison_path = output_dir / f"{source_path.stem}_comparison{sl_suffix}.png"
     comparison.save(comparison_path)
     print(f"Saved comparison: {comparison_path}")
 
@@ -261,18 +389,32 @@ def convert_with_all_palettes(source_path: str, output_dir: str = None):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python image_converter.py <source_image> [output_dir]")
+        print("Usage: python image_converter.py <source_image> [output_dir] [--scanline N]")
         print("\nConverts an image to all VIC-II extended palettes using")
         print("perceptual color matching (OKLab color space).")
+        print("\nOptions:")
+        print("  --scanline N    Limit to N colors per scanline (VIC-II hardware limit)")
+        print("                  Use --scanline 16 for authentic VIC-II constraints")
         print("\nOutputs:")
         print("  - Individual converted images for each palette")
         print("  - A comparison image showing all versions side by side")
         sys.exit(1)
 
+    # Parse arguments
     source_path = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    output_dir = None
+    scanline_limit = None
 
-    convert_with_all_palettes(source_path, output_dir)
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == '--scanline' and i + 1 < len(sys.argv):
+            scanline_limit = int(sys.argv[i + 1])
+            i += 2
+        else:
+            output_dir = sys.argv[i]
+            i += 1
+
+    convert_with_all_palettes(source_path, output_dir, scanline_limit)
 
 
 if __name__ == "__main__":
