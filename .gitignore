@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# Generated test outputs (converted images, not palette definitions)
+*_comparison.png
+*_V0_C64.png
+*_V0_*.png
+*_V1_RGB*.png
+*_V2_Hybrid*.png
+*_V3_HSL*.png
+*_V4_OKLab*.png
+*_V5_Artistic*.png
+*_V6_Refined*.png
+*_V7_Optimized*.png
+*_V8_Ultimate*.png
+lilith_scaled.png
+test_image.png
+
+# Test images (copyrighted artwork - not included in repo)
+Facet_*.png
+Agony_*.png
+AlienBreed.png
+DefenderOfTheCrown*.png
+DefenderOfTheCrown*.gif
+Unreal.png
+New-Project*.jpg
+
+# Temp test files
+test_v7.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
