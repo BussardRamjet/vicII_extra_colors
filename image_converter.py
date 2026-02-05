@@ -432,6 +432,306 @@ def convert_image_multicolor(source: Image.Image, palette: List[Color],
     return result
 
 
+# =============================================================================
+# True Hardware Multicolor Mode (4x8 cells, global background)
+# =============================================================================
+
+def select_global_background(source: Image.Image, palette: List[Color],
+                              palette_oklab: List[Tuple[float, float, float]]) -> int:
+    """
+    Select the best global background color for the entire image.
+    Chooses the color that minimizes error across all pixels.
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    width, height = source.size
+    pixels = source.load()
+
+    # Count votes for each palette color
+    palette_votes = {}
+
+    for y in range(height):
+        for x in range(0, width, 2):  # Sample every 2 for multicolor
+            r, g, b = pixels[x, y]
+            source_lab = rgb_to_oklab(r, g, b)
+
+            # Find best palette match
+            best_idx = 0
+            best_dist = float('inf')
+            for idx, pal_lab in enumerate(palette_oklab):
+                dist = oklab_distance(source_lab, pal_lab)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+
+            if best_idx not in palette_votes:
+                palette_votes[best_idx] = 0
+            palette_votes[best_idx] += 1
+
+    # Return most voted color
+    if not palette_votes:
+        return 0
+    return max(palette_votes.items(), key=lambda x: x[1])[0]
+
+
+def select_best_16_from_256(source: Image.Image, palette: List[Color]) -> List[int]:
+    """
+    Select the best 16 colors from a 256-color palette for this image.
+    Uses k-means style clustering in OKLab space.
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    width, height = source.size
+    pixels = source.load()
+
+    # Pre-compute palette OKLab
+    palette_oklab = [rgb_to_oklab(c.r, c.g, c.b) for c in palette]
+
+    # Count how often each palette color is the best match
+    palette_usage = {}
+
+    for y in range(height):
+        for x in range(0, width, 2):  # Sample for multicolor
+            r, g, b = pixels[x, y]
+            source_lab = rgb_to_oklab(r, g, b)
+
+            best_idx = 0
+            best_dist = float('inf')
+            for idx, pal_lab in enumerate(palette_oklab):
+                dist = oklab_distance(source_lab, pal_lab)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+
+            if best_idx not in palette_usage:
+                palette_usage[best_idx] = {'count': 0, 'total_error': 0}
+            palette_usage[best_idx]['count'] += 1
+            palette_usage[best_idx]['total_error'] += best_dist
+
+    # Score each palette color by usage and quality
+    scored = []
+    for idx, stats in palette_usage.items():
+        # Higher count and lower error = better
+        avg_error = stats['total_error'] / stats['count'] if stats['count'] > 0 else 1.0
+        score = stats['count'] / (avg_error + 0.01)
+        scored.append((idx, score))
+
+    # Sort by score and take top 16
+    scored.sort(key=lambda x: x[1], reverse=True)
+    selected = [idx for idx, _ in scored[:16]]
+
+    # Pad with first palette colors if needed
+    while len(selected) < 16:
+        for i in range(len(palette)):
+            if i not in selected:
+                selected.append(i)
+                if len(selected) >= 16:
+                    break
+
+    return selected[:16]
+
+
+def select_cell_colors_4x8(source: Image.Image, cell_x: int, cell_y: int,
+                           cell_width: int, cell_height: int,
+                           background_idx: int, palette: List[Color],
+                           palette_oklab: List[Tuple[float, float, float]],
+                           num_colors: int = 3) -> List[int]:
+    """
+    Select best 3 colors for a 4x8 cell (spanning multiple scanlines).
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    width, height = source.size
+    pixels = source.load()
+    bg_lab = palette_oklab[background_idx]
+
+    # Collect all pixels in this cell
+    cell_pixels = []
+    for y in range(cell_y, min(cell_y + cell_height, height)):
+        for x in range(cell_x, min(cell_x + cell_width, width), 2):
+            cell_pixels.append(pixels[x, y])
+
+    if not cell_pixels:
+        return []
+
+    # Find which palette colors (other than background) best serve these pixels
+    color_importance = {}
+
+    for r, g, b in cell_pixels:
+        source_lab = rgb_to_oklab(r, g, b)
+        bg_dist = oklab_distance(source_lab, bg_lab)
+
+        best_idx = None
+        best_dist = float('inf')
+
+        for idx, pal_lab in enumerate(palette_oklab):
+            if idx == background_idx:
+                continue
+            dist = oklab_distance(source_lab, pal_lab)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+
+        if best_idx is not None and best_dist < bg_dist:
+            if best_idx not in color_importance:
+                color_importance[best_idx] = 0
+            improvement = bg_dist - best_dist
+            color_importance[best_idx] += improvement
+
+    sorted_colors = sorted(color_importance.items(), key=lambda x: x[1], reverse=True)
+    return [idx for idx, _ in sorted_colors[:num_colors]]
+
+
+def convert_image_multicolor_true(source: Image.Image, palette: List[Color],
+                                   cell_width: int = 8, cell_height: int = 8,
+                                   double_pixels: bool = True) -> Image.Image:
+    """
+    Convert using TRUE VIC-II multicolor constraints:
+    - 1 global background color (entire image)
+    - 3 colors per 4x8 cell (4 multicolor pixels = 8 source pixels wide, 8 lines tall)
+    - Double-wide pixels
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    src_width, height = source.size
+    out_width = src_width if double_pixels else src_width // 2
+
+    result = Image.new('RGB', (out_width, height))
+    source_pixels = source.load()
+    result_pixels = result.load()
+
+    # Pre-compute OKLab values
+    palette_oklab = [rgb_to_oklab(c.r, c.g, c.b) for c in palette]
+
+    # Select global background
+    bg_idx = select_global_background(source, palette, palette_oklab)
+    bg_color = palette[bg_idx]
+    print(f"    Global background: #{bg_color.r:02x}{bg_color.g:02x}{bg_color.b:02x}")
+
+    # Process each 4x8 cell
+    for cell_y in range(0, height, cell_height):
+        for cell_x in range(0, src_width, cell_width):
+            # Select 3 colors for this cell
+            cell_color_indices = select_cell_colors_4x8(
+                source, cell_x, cell_y, cell_width, cell_height,
+                bg_idx, palette, palette_oklab, num_colors=3
+            )
+
+            # Build 4-color palette for this cell
+            cell_palette_indices = [bg_idx] + cell_color_indices
+            cell_palette_oklab = [palette_oklab[i] for i in cell_palette_indices]
+
+            # Convert all pixels in this cell
+            for y in range(cell_y, min(cell_y + cell_height, height)):
+                for x in range(cell_x, min(cell_x + cell_width, src_width), 2):
+                    r, g, b = source_pixels[x, y]
+                    source_lab = rgb_to_oklab(r, g, b)
+
+                    # Find nearest from cell's 4-color palette
+                    best_local_idx = 0
+                    best_dist = float('inf')
+
+                    for local_idx, pal_lab in enumerate(cell_palette_oklab):
+                        dist = oklab_distance(source_lab, pal_lab)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_local_idx = local_idx
+
+                    pal_idx = cell_palette_indices[best_local_idx]
+                    pal_color = palette[pal_idx]
+                    color_rgb = (pal_color.r, pal_color.g, pal_color.b)
+
+                    if double_pixels:
+                        result_pixels[x, y] = color_rgb
+                        if x + 1 < out_width:
+                            result_pixels[x + 1, y] = color_rgb
+                    else:
+                        result_pixels[x // 2, y] = color_rgb
+
+    return result
+
+
+def convert_image_multicolor_fixed16(source: Image.Image, palette: List[Color],
+                                      cell_width: int = 8, cell_height: int = 8,
+                                      double_pixels: bool = True) -> Image.Image:
+    """
+    Convert using extended palette with fixed 16-color constraint:
+    - Select best 16 colors from 256-color palette upfront
+    - 1 global background color (entire image)
+    - 3 colors per 4x8 cell (4 multicolor pixels = 8 source pixels wide)
+    - Double-wide pixels
+    """
+    if source.mode != 'RGB':
+        source = source.convert('RGB')
+
+    src_width, height = source.size
+    out_width = src_width if double_pixels else src_width // 2
+
+    result = Image.new('RGB', (out_width, height))
+    source_pixels = source.load()
+    result_pixels = result.load()
+
+    # Select best 16 colors from 256
+    print("    Selecting best 16 colors from extended palette...")
+    selected_indices = select_best_16_from_256(source, palette)
+
+    # Create reduced palette
+    reduced_palette = [palette[i] for i in selected_indices]
+    reduced_oklab = [rgb_to_oklab(c.r, c.g, c.b) for c in reduced_palette]
+
+    print(f"    Selected colors: {[f'#{palette[i].r:02x}{palette[i].g:02x}{palette[i].b:02x}' for i in selected_indices[:8]]}...")
+
+    # Select global background from reduced palette
+    bg_idx = select_global_background(source, reduced_palette, reduced_oklab)
+    bg_color = reduced_palette[bg_idx]
+    print(f"    Global background: #{bg_color.r:02x}{bg_color.g:02x}{bg_color.b:02x}")
+
+    # Process each 4x8 cell
+    for cell_y in range(0, height, cell_height):
+        for cell_x in range(0, src_width, cell_width):
+            # Select 3 colors for this cell from reduced palette
+            cell_color_indices = select_cell_colors_4x8(
+                source, cell_x, cell_y, cell_width, cell_height,
+                bg_idx, reduced_palette, reduced_oklab, num_colors=3
+            )
+
+            # Build 4-color palette for this cell
+            cell_palette_indices = [bg_idx] + cell_color_indices
+            cell_palette_oklab = [reduced_oklab[i] for i in cell_palette_indices]
+
+            # Convert all pixels in this cell
+            for y in range(cell_y, min(cell_y + cell_height, height)):
+                for x in range(cell_x, min(cell_x + cell_width, src_width), 2):
+                    r, g, b = source_pixels[x, y]
+                    source_lab = rgb_to_oklab(r, g, b)
+
+                    best_local_idx = 0
+                    best_dist = float('inf')
+
+                    for local_idx, pal_lab in enumerate(cell_palette_oklab):
+                        dist = oklab_distance(source_lab, pal_lab)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_local_idx = local_idx
+
+                    pal_idx = cell_palette_indices[best_local_idx]
+                    pal_color = reduced_palette[pal_idx]
+                    color_rgb = (pal_color.r, pal_color.g, pal_color.b)
+
+                    if double_pixels:
+                        result_pixels[x, y] = color_rgb
+                        if x + 1 < out_width:
+                            result_pixels[x + 1, y] = color_rgb
+                    else:
+                        result_pixels[x // 2, y] = color_rgb
+
+    return result
+
+
 def create_comparison_image(source: Image.Image, converted_images: List[Tuple[str, Image.Image]],
                             max_width: int = 1920, multicolor: bool = False) -> Image.Image:
     """Create a side-by-side comparison image"""
@@ -504,7 +804,8 @@ def create_comparison_image(source: Image.Image, converted_images: List[Tuple[st
 
 def convert_with_all_palettes(source_path: str, output_dir: str = None,
                                scanline_limit: int = None,
-                               multicolor: bool = False):
+                               multicolor: bool = False,
+                               multicolor_true: bool = False):
     """
     Convert an image using all available palettes.
 
@@ -512,7 +813,8 @@ def convert_with_all_palettes(source_path: str, output_dir: str = None,
         source_path: Path to source image
         output_dir: Output directory (default: same as source)
         scanline_limit: Max colors per scanline (VIC-II mode), None for unlimited
-        multicolor: Use VIC-II multicolor mode (double-wide pixels, 4 colors per cell)
+        multicolor: Use VIC-II multicolor mode (per-scanline bg, 4x1 cells)
+        multicolor_true: Use TRUE VIC-II multicolor (global bg, 4x8 cells)
     """
 
     # Load source image
@@ -520,7 +822,9 @@ def convert_with_all_palettes(source_path: str, output_dir: str = None,
     source = Image.open(source_path)
     print(f"  Size: {source.size[0]}x{source.size[1]}")
     print(f"  Mode: {source.mode}")
-    if multicolor:
+    if multicolor_true:
+        print(f"  TRUE Multicolor mode: global bg + 3 colors per 4x8 cell, double-wide pixels")
+    elif multicolor:
         print(f"  Multicolor mode: 1 bg/scanline + 3 colors per 4-pixel cell, double-wide pixels")
     elif scanline_limit:
         print(f"  Scanline limit: {scanline_limit} colors per line")
@@ -531,59 +835,91 @@ def convert_with_all_palettes(source_path: str, output_dir: str = None,
         output_dir = source_path.parent
     output_dir = Path(output_dir)
 
-    # Define palettes to use
-    if multicolor:
-        # Multicolor mode: just C64 original vs extended palette
-        palettes = [
-            ("C64", create_palette_v0_c64_original()),
-            ("Extended", create_palette_v8_ultimate()),
-        ]
-    else:
-        palettes = [
-            ("V0_C64", create_palette_v0_c64_original()),
-            ("V1_RGB332", create_palette_v1_rgb332()),
-            ("V2_Hybrid", create_palette_v2_hybrid_666()),
-            ("V3_HSL", create_palette_v3_hsl()),
-            ("V4_OKLab", create_palette_v4_perceptual()),
-            ("V5_Artistic", create_palette_v5_artistic()),
-            ("V6_Refined", create_palette_v6_refined_artistic()),
-            ("V8_Ultimate", create_palette_v8_ultimate()),
-        ]
-
     converted_images = []
+    c64_palette = create_palette_v0_c64_original()
+    ext_palette = create_palette_v8_ultimate()
 
-    for name, palette in palettes:
-        print(f"Converting with {name}...")
+    if multicolor_true or multicolor:
+        # Generate all 4 multicolor variants for comparison
 
-        if multicolor:
-            converted = convert_image_multicolor(source, palette)
-            suffix = f"_{name}_mc"
-        elif scanline_limit:
-            converted = convert_image_scanline_limited(source, palette, scanline_limit)
-            suffix = f"_{name}_sl{scanline_limit}"
-        else:
-            matcher = PaletteMatcher(palette)
-            converted = convert_image(source, matcher)
-            suffix = f"_{name}"
-
-        converted_images.append((name, converted))
-
-        # Save individual converted image
-        out_path = output_dir / f"{source_path.stem}{suffix}.png"
+        # 1. C64 with raster interrupts (per-scanline bg, 4x1 cells)
+        print("Converting with C64 Raster (per-scanline bg, 4x1 cells)...")
+        converted = convert_image_multicolor(source, c64_palette)
+        converted_images.append(("C64_Raster", converted))
+        out_path = output_dir / f"{source_path.stem}_C64_raster_mc.png"
         converted.save(out_path)
         print(f"  Saved: {out_path}")
+
+        # 2. Extended with raster interrupts (per-scanline bg, 4x1 cells)
+        print("Converting with Extended Raster (per-scanline bg, 4x1 cells)...")
+        converted = convert_image_multicolor(source, ext_palette)
+        converted_images.append(("Ext_Raster", converted))
+        out_path = output_dir / f"{source_path.stem}_Ext_raster_mc.png"
+        converted.save(out_path)
+        print(f"  Saved: {out_path}")
+
+        # 3. C64 True Hardware (global bg, 4x8 cells)
+        print("Converting with C64 True (global bg, 4x8 cells)...")
+        converted = convert_image_multicolor_true(source, c64_palette)
+        converted_images.append(("C64_True", converted))
+        out_path = output_dir / f"{source_path.stem}_C64_true_mc.png"
+        converted.save(out_path)
+        print(f"  Saved: {out_path}")
+
+        # 4. Extended Fixed 16 (global bg, 4x8 cells, best 16 from 256)
+        print("Converting with Ext Fixed16 (global bg, 4x8 cells, 16 colors)...")
+        converted = convert_image_multicolor_fixed16(source, ext_palette)
+        converted_images.append(("Ext_Fixed16", converted))
+        out_path = output_dir / f"{source_path.stem}_Ext_fixed16_mc.png"
+        converted.save(out_path)
+        print(f"  Saved: {out_path}")
+
+    else:
+        # Standard conversion modes
+        if scanline_limit:
+            palettes = [
+                ("V0_C64", create_palette_v0_c64_original()),
+                ("V8_Ultimate", create_palette_v8_ultimate()),
+            ]
+        else:
+            palettes = [
+                ("V0_C64", create_palette_v0_c64_original()),
+                ("V1_RGB332", create_palette_v1_rgb332()),
+                ("V2_Hybrid", create_palette_v2_hybrid_666()),
+                ("V3_HSL", create_palette_v3_hsl()),
+                ("V4_OKLab", create_palette_v4_perceptual()),
+                ("V5_Artistic", create_palette_v5_artistic()),
+                ("V6_Refined", create_palette_v6_refined_artistic()),
+                ("V8_Ultimate", create_palette_v8_ultimate()),
+            ]
+
+        for name, palette in palettes:
+            print(f"Converting with {name}...")
+            if scanline_limit:
+                converted = convert_image_scanline_limited(source, palette, scanline_limit)
+                suffix = f"_{name}_sl{scanline_limit}"
+            else:
+                matcher = PaletteMatcher(palette)
+                converted = convert_image(source, matcher)
+                suffix = f"_{name}"
+
+            converted_images.append((name, converted))
+            out_path = output_dir / f"{source_path.stem}{suffix}.png"
+            converted.save(out_path)
+            print(f"  Saved: {out_path}")
 
     # Create comparison image
     print("Creating comparison image...")
 
-    if multicolor:
-        mode_suffix = "_mc"
+    if multicolor_true or multicolor:
+        mode_suffix = "_mc_all"
     elif scanline_limit:
         mode_suffix = f"_sl{scanline_limit}"
     else:
         mode_suffix = ""
 
-    comparison = create_comparison_image(source, converted_images, multicolor=multicolor)
+    is_multicolor = multicolor or multicolor_true
+    comparison = create_comparison_image(source, converted_images, multicolor=is_multicolor)
     comparison_path = output_dir / f"{source_path.stem}_comparison{mode_suffix}.png"
     comparison.save(comparison_path)
     print(f"Saved comparison: {comparison_path}")
@@ -598,13 +934,18 @@ def main():
         print("\nConverts an image to all VIC-II extended palettes using")
         print("perceptual color matching (OKLab color space).")
         print("\nOptions:")
-        print("  --scanline N    Limit to N colors per scanline (VIC-II hardware limit)")
-        print("                  Use --scanline 16 for authentic VIC-II constraints")
-        print("  --multicolor    VIC-II multicolor bitmap mode:")
-        print("                  - Double-wide pixels (half horizontal resolution)")
-        print("                  - 1 background color per scanline (raster interrupt)")
-        print("                  - 3 additional colors per 4-pixel cell")
-        print("                  - Each pixel uses one of 4 colors (bg + 3 cell)")
+        print("  --scanline N       Limit to N colors per scanline (VIC-II hardware limit)")
+        print("                     Use --scanline 16 for authentic VIC-II constraints")
+        print("  --multicolor       VIC-II multicolor with raster interrupts:")
+        print("                     - Double-wide pixels")
+        print("                     - 1 background color per scanline (changeable)")
+        print("                     - 3 additional colors per 4-pixel cell")
+        print("  --multicolor-true  TRUE VIC-II hardware multicolor:")
+        print("                     - Double-wide pixels")
+        print("                     - 1 GLOBAL background (entire image)")
+        print("                     - 3 colors per 4x8 cell (fixed for 8 scanlines)")
+        print("                     - C64: uses 16-color VIC-II palette")
+        print("                     - Extended: picks best 16 from 256 colors")
         print("\nOutputs:")
         print("  - Individual converted images for each palette")
         print("  - A comparison image showing all versions side by side")
@@ -615,12 +956,16 @@ def main():
     output_dir = None
     scanline_limit = None
     multicolor = False
+    multicolor_true = False
 
     i = 2
     while i < len(sys.argv):
         if sys.argv[i] == '--scanline' and i + 1 < len(sys.argv):
             scanline_limit = int(sys.argv[i + 1])
             i += 2
+        elif sys.argv[i] == '--multicolor-true':
+            multicolor_true = True
+            i += 1
         elif sys.argv[i] == '--multicolor':
             multicolor = True
             i += 1
@@ -628,7 +973,7 @@ def main():
             output_dir = sys.argv[i]
             i += 1
 
-    convert_with_all_palettes(source_path, output_dir, scanline_limit, multicolor)
+    convert_with_all_palettes(source_path, output_dir, scanline_limit, multicolor, multicolor_true)
 
 
 if __name__ == "__main__":

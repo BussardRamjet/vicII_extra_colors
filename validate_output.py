@@ -327,9 +327,147 @@ def validate_extended_multicolor(img: Image.Image, cell_width: int = 4) -> Valid
     return result
 
 
-def validate_all(original_path: str, c64_path: str, extended_path: str):
+def validate_c64_true_multicolor(img: Image.Image, cell_width: int = 4,
+                                  cell_height: int = 8) -> ValidationResult:
+    """
+    Validate TRUE C64 hardware multicolor:
+    - Must have wide pixels (double-wide)
+    - Must use only C64 16-color palette
+    - 1 GLOBAL background color (entire image)
+    - 3 colors per 4x8 cell (shared across 8 scanlines)
+    """
+    result = ValidationResult("C64 True Hardware Multicolor")
+
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    width, height = img.size
+    pixels = img.load()
+    result.add_info(f"Resolution: {width}x{height}")
+
+    # Check for wide pixels
+    is_wide, pair_percentage = check_wide_pixels(img)
+    result.add_info(f"Pixel pairing: {pair_percentage:.1f}%")
+
+    if not is_wide:
+        result.error(f"Not wide pixels ({pair_percentage:.1f}% paired) - should be >95%")
+
+    # Check all colors are C64 palette
+    unique_colors = get_unique_colors(img)
+    result.add_info(f"Unique colors: {len(unique_colors)}")
+
+    non_c64_colors = []
+    for color in unique_colors:
+        if not is_c64_color(color):
+            non_c64_colors.append(color)
+
+    if non_c64_colors:
+        result.error(f"Found {len(non_c64_colors)} non-C64 colors")
+        for color in non_c64_colors[:5]:
+            nearest = find_nearest_c64_color(color)
+            result.add_info(f"  Non-C64 color: RGB{color} (nearest C64: RGB{nearest})")
+
+    # Find global background (most common color in image)
+    color_counts = defaultdict(int)
+    for y in range(height):
+        for x in range(0, width, 2):
+            color_counts[pixels[x, y]] += 1
+    global_bg = max(color_counts.items(), key=lambda x: x[1])[0]
+    result.add_info(f"Global background: RGB{global_bg}")
+
+    # Check 4x8 cell constraints
+    cell_violations = 0
+    cells_checked = 0
+
+    for cell_y in range(0, height, cell_height):
+        for cell_x in range(0, width, cell_width * 2):
+            cells_checked += 1
+            cell_colors = set()
+
+            for y in range(cell_y, min(cell_y + cell_height, height)):
+                for x in range(cell_x, min(cell_x + cell_width * 2, width), 2):
+                    cell_colors.add(pixels[x, y])
+
+            if len(cell_colors) > 4:
+                cell_violations += 1
+
+    result.add_info(f"4x8 cells checked: {cells_checked}")
+
+    if cell_violations > 0:
+        result.error(f"{cell_violations} 4x8 cells have more than 4 colors")
+
+    return result
+
+
+def validate_extended_fixed16_multicolor(img: Image.Image, cell_width: int = 4,
+                                          cell_height: int = 8) -> ValidationResult:
+    """
+    Validate Extended Fixed 16-color multicolor:
+    - Must have wide pixels (double-wide)
+    - Must use only 16 unique colors (selected from 256)
+    - 1 GLOBAL background color (entire image)
+    - 3 colors per 4x8 cell (shared across 8 scanlines)
+    """
+    result = ValidationResult("Extended Fixed 16 Multicolor")
+
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    width, height = img.size
+    pixels = img.load()
+    result.add_info(f"Resolution: {width}x{height}")
+
+    # Check for wide pixels
+    is_wide, pair_percentage = check_wide_pixels(img)
+    result.add_info(f"Pixel pairing: {pair_percentage:.1f}%")
+
+    if not is_wide:
+        result.error(f"Not wide pixels ({pair_percentage:.1f}% paired) - should be >95%")
+
+    # Check color count (should be exactly 16 or less)
+    unique_colors = get_unique_colors(img)
+    result.add_info(f"Unique colors: {len(unique_colors)}")
+
+    if len(unique_colors) > 16:
+        result.error(f"Uses {len(unique_colors)} colors - should be max 16")
+
+    # Find global background
+    color_counts = defaultdict(int)
+    for y in range(height):
+        for x in range(0, width, 2):
+            color_counts[pixels[x, y]] += 1
+    global_bg = max(color_counts.items(), key=lambda x: x[1])[0]
+    result.add_info(f"Global background: RGB{global_bg}")
+
+    # Check 4x8 cell constraints
+    cell_violations = 0
+    cells_checked = 0
+
+    for cell_y in range(0, height, cell_height):
+        for cell_x in range(0, width, cell_width * 2):
+            cells_checked += 1
+            cell_colors = set()
+
+            for y in range(cell_y, min(cell_y + cell_height, height)):
+                for x in range(cell_x, min(cell_x + cell_width * 2, width), 2):
+                    cell_colors.add(pixels[x, y])
+
+            if len(cell_colors) > 4:
+                cell_violations += 1
+
+    result.add_info(f"4x8 cells checked: {cells_checked}")
+
+    if cell_violations > 0:
+        result.error(f"{cell_violations} 4x8 cells have more than 4 colors")
+
+    return result
+
+
+def validate_all(original_path: str, c64_path: str, extended_path: str, true_mode: bool = False):
     """Validate all three images"""
     print("VIC-II Output Validator")
+    if true_mode:
+        print("(TRUE Hardware Mode - 4x8 cells, global background)")
     print("="*60)
 
     # Load images
@@ -358,8 +496,13 @@ def validate_all(original_path: str, c64_path: str, extended_path: str):
 
     # Validate each
     orig_result = validate_original(original)
-    c64_result = validate_c64_multicolor(c64)
-    ext_result = validate_extended_multicolor(extended)
+
+    if true_mode:
+        c64_result = validate_c64_true_multicolor(c64)
+        ext_result = validate_extended_fixed16_multicolor(extended)
+    else:
+        c64_result = validate_c64_multicolor(c64)
+        ext_result = validate_extended_multicolor(extended)
 
     # Print reports
     orig_result.print_report()
@@ -381,20 +524,26 @@ def validate_all(original_path: str, c64_path: str, extended_path: str):
 
 def main():
     if len(sys.argv) < 4:
-        print("Usage: python validate_output.py <original> <c64_mc> <extended_mc>")
+        print("Usage: python validate_output.py <original> <c64_mc> <extended_mc> [--true]")
         print("\nValidates that output images follow VIC-II constraints:")
         print("  - Original: full resolution, full palette, no wide pixels")
         print("  - C64: wide pixels, C64 16-color palette, multicolor limits")
-        print("  - Extended: wide pixels, 256-color palette, multicolor limits")
-        print("\nExample:")
-        print("  python validate_output.py Unreal.png Unreal_C64_mc.png Unreal_Extended_mc.png")
+        print("  - Extended: wide pixels, extended palette, multicolor limits")
+        print("\nOptions:")
+        print("  --true    Validate TRUE hardware mode (4x8 cells, global background)")
+        print("            - C64: same as above but 4x8 cell constraints")
+        print("            - Extended: must use max 16 colors, 4x8 cell constraints")
+        print("\nExamples:")
+        print("  python validate_output.py img.png img_C64_mc.png img_Extended_mc.png")
+        print("  python validate_output.py img.png img_C64_true_mc.png img_Ext_fixed16_mc.png --true")
         sys.exit(1)
 
     original_path = sys.argv[1]
     c64_path = sys.argv[2]
     extended_path = sys.argv[3]
+    true_mode = '--true' in sys.argv
 
-    success = validate_all(original_path, c64_path, extended_path)
+    success = validate_all(original_path, c64_path, extended_path, true_mode)
     sys.exit(0 if success else 1)
 
 
