@@ -90,30 +90,81 @@ STA $D02F       ; Clear EXT_CTRL
 
 ### Phase 2: Extended Register Map
 
-Once unlocked, the following registers become active:
+Once unlocked, only **4 new registers** are needed:
 
 | Address | Name | R/W | Description |
 |---------|------|-----|-------------|
 | $D02F | EXT_CTRL | R/W | Extension control register |
 | $D030 | EXT_STATUS | R | Extension status/version |
-| $D031 | PAL_PTR_LO | R/W | Palette table pointer (low byte) - optional |
-| $D032 | PAL_PTR_HI | R/W | Palette table pointer (high byte) - optional |
-| $D033 | Reserved | - | Future expansion |
-| $D034 | COLOR_MODE | R/W | Color mode selection |
-| $D035 | PAL_INDEX | R/W | Screen palette slot select (0-15) |
-| $D036 | PAL_DATA | R/W | Screen mapping (0-255 = Ultimate palette index) |
-| $D037-$D03E | Reserved | - | Future expansion |
+| $D031 | PAL_PTR_LO | R/W | Palette pointer low byte (VIC bank-relative) |
+| $D032 | PAL_PTR_HI | R/W | Palette pointer high byte (bits 5-0 used, 14-bit) |
+| $D033-$D03E | Reserved | - | Future expansion |
 | $D03F | EXT_LOCK | W | Lock/unlock register |
 
-#### How Screen Palette Mapping Works
-```
-; Example: Map VIC-II color slot 2 (normally red) to Ultimate palette color #47
-LDA #$02        ; Select slot 2
-STA $D035
-LDA #$2F        ; Ultimate palette index 47
-STA $D036
+**Palette data lives in C64 RAM within the current VIC bank** - just modify memory directly!
 
-; Now any pixel using color 2 displays Ultimate palette color #47
+#### VIC Bank-Relative Addressing
+
+Pointers use the same 14-bit addressing as other VIC data (screen RAM, charset, bitmap):
+
+```
+Actual address = VIC_BANK_BASE + (PAL_PTR_HI[5:0] << 8) + PAL_PTR_LO
+
+VIC Bank selection via CIA2 ($DD00 bits 1-0):
+  %11 → Bank 0: $0000-$3FFF
+  %10 → Bank 1: $4000-$7FFF
+  %01 → Bank 2: $8000-$BFFF
+  %00 → Bank 3: $C000-$FFFF
+```
+
+**Why VIC bank-relative:**
+- Consistent with how VIC accesses all other data (screen, charset, sprites)
+- Palette naturally co-located with graphics data
+- Simpler hardware implementation (reuses existing 14-bit address bus)
+- Matches mental model of existing VIC programming
+
+#### EXT_CTRL ($D02F) Bit Layout
+```
+Bit 7: Extended mode enable (1=enabled, 0=disabled)
+Bits 6-0: Reserved (0)
+```
+
+When bit 7 is set, PAL_PTR points to a 16-byte palette mapping table in RAM.
+
+#### How Screen Palette Mapping Works
+```asm
+; Assume VIC bank 0 ($0000-$3FFF), palette at $3000
+; Set up palette pointer (VIC bank-relative offset = $3000)
+LDA #$00
+STA $D031       ; Low byte
+LDA #$30
+STA $D032       ; High byte (bits 5-0 = $30)
+
+; Enable extended mode
+LDA #$80
+STA $D02F
+
+; Modify palette directly in RAM
+LDA #$2F        ; Ultimate palette index 47
+STA $3002       ; Slot 2 now maps to color 47
+
+; Palette data at $3000 (within VIC bank 0)
+my_palette = $3000
+; .byte $00,$01,$02,$03,$04,$05,$06,$07  ; Slots 0-7 (defaults)
+; .byte $08,$09,$0A,$0B,$0C,$0D,$0E,$0F  ; Slots 8-15 (defaults)
+```
+
+**VIC Bank Example:**
+```asm
+; Using VIC bank 2 ($8000-$BFFF)
+LDA #%00000001  ; Select bank 2
+STA $DD00
+
+; Palette at $8800 → VIC offset = $0800
+LDA #$00
+STA $D031
+LDA #$08
+STA $D032
 ```
 
 #### How Sprite Colors Work in Extended Mode
@@ -126,9 +177,9 @@ Sprites only use 3 colors max (plus transparent), so no mapping table needed!
 | $D026 | Sprite Multicolor 1 (bits 3-0 = color 0-15) | Full 8-bit Ultimate index |
 | $D027-$D02E | Sprite 0-7 color (bits 3-0 = color 0-15) | Full 8-bit Ultimate index |
 
-The upper 4 bits of $D025-$D02E are unused on real hardware (read as 1). In extended mode, all 8 bits become active.
+The upper 4 bits of $D020-$D02E are unused on real hardware (read as 1). In extended mode, all 8 bits become active.
 
-```
+```asm
 ; Set sprite 0 color to Ultimate palette index #200
 LDA #$C8
 STA $D027
@@ -138,23 +189,16 @@ LDA #$2F
 STA $D025
 ```
 
-**No new registers needed!** Just write the Ultimate index directly to existing registers.
+**No new registers needed for border or sprites!** Just write the Ultimate index directly to existing registers.
 
-#### EXT_CTRL ($D02F) Bit Layout
-```
-Bit 7: Extended mode enable (1=enabled, 0=disabled)
-Bit 6: Palette auto-increment (for fast palette writes)
-Bit 5: Per-scanline palette swap enable
-Bit 4: Reserved
-Bit 3-0: Active color mode
-```
+#### Summary: Direct 8-bit Color Registers (Extended Mode)
+These existing VIC-II registers use full 8-bit Ultimate palette index in extended mode:
 
-#### COLOR_MODE ($D034) Values
-```
-$00: Standard VIC-II (fixed 16 colors, mapping disabled)
-$01: Extended palette mapping enabled (16 slots → 256 colors)
-$02: Extended + per-scanline palette auto-switch
-```
+| Address | Purpose |
+|---------|---------|
+| $D025 | Sprite multicolor 0 (shared) |
+| $D026 | Sprite multicolor 1 (shared) |
+| $D027-$D02E | Sprite 0-7 individual colors |
 
 Note: The multicolor cell rules (4×1 vs 4×8, per-scanline vs global bg) are software conventions, not hardware modes. The VIC-II hardware constraints remain the same.
 
@@ -166,17 +210,18 @@ Note: The multicolor cell rules (4×1 vs 4×8, per-scanline vs global bg) are so
 The VIC-II still uses 16 color slots (0-15), but each slot maps to one of the 256 colors in our pre-defined **Ultimate Palette** (V8). The Ultimate Palette is fixed in the emulator/hardware - software just picks which 16 colors to use.
 
 #### Palette Mapping Table Format
-16 entries × 1 byte = **16 bytes total**
+16 entries × 1 byte = **16 bytes total** in C64 RAM
 
 ```
-Offset $00: Color slot 0 → Ultimate palette index (0-255)
-Offset $01: Color slot 1 → Ultimate palette index (0-255)
+PAL_PTR + $00: Color slot 0 → Ultimate palette index (0-255)
+PAL_PTR + $01: Color slot 1 → Ultimate palette index (0-255)
 ...
-Offset $0F: Color slot 15 → Ultimate palette index (0-255)
+PAL_PTR + $0F: Color slot 15 → Ultimate palette index (0-255)
 ```
 
 #### Default Mapping (Compatibility)
-On reset or when extended mode disabled:
+On reset or when extended mode disabled, VIC uses standard colors.
+Typical initialization:
 ```
 Slot 0  → Index 0   (Black)
 Slot 1  → Index 1   (White)
@@ -186,21 +231,11 @@ Slot 15 → Index 15  (Light Grey)
 ```
 The first 16 entries of the Ultimate Palette match standard VIC-II colors.
 
-#### Palette Location Options
-
-**Option 1: Direct Register Access (Recommended)**
-- Use PAL_INDEX ($D035) to select slot (0-15)
-- Use PAL_DATA ($D036) to read/write the mapping (0-255)
-- Simple, no RAM needed, fast for per-scanline changes
-
-**Option 2: Pointer-Based**
-- PAL_PTR_LO/HI points to 16-byte table in VIC memory
-- Good for bulk palette loading
-
-#### Recommended: Option 1 (Direct Register Access)
-- Only 16 bytes to manage
-- Register access is fast enough
-- No RAM overhead
+#### Why Pointer-Based (No Registers)
+- CPU can modify palette directly in RAM - faster than register access
+- Bulk changes are trivial (just copy 16 bytes)
+- Software can use raster interrupts to swap palettes per-scanline if desired
+- Only 4 new VIC registers needed total
 
 ---
 
@@ -222,14 +257,13 @@ Extended Mode:  Slot 0-15 → Mapped to any of 256 Ultimate palette colors
 The only difference is the **palette mapping table** that translates slot → Ultimate color.
 
 #### Example
-```
+```asm
 ; Standard: Slot 6 always displays VIC-II blue (#40318D)
 ; Extended: Slot 6 can display ANY of 256 colors
 
-LDA #$06        ; Select slot 6
-STA $D035
-LDA #$C0        ; Map to Ultimate palette index 192 (maybe a nice teal)
-STA $D036
+; Assuming PAL_PTR points to my_palette
+LDA #$C0        ; Ultimate palette index 192 (maybe a nice teal)
+STA my_palette+6  ; Modify slot 6 directly in RAM
 
 ; Now everywhere color 6 is used, it shows color #192 instead of blue
 ```
@@ -250,19 +284,17 @@ The VIC-II multicolor logic is unchanged:
 The only change is the **final color lookup** - instead of fixed VIC-II colors, each slot goes through the 16-byte mapping table to get an Ultimate palette color.
 
 #### Existing Code Compatibility
-Since the 4-bit indices are unchanged, existing multicolor code works perfectly. The only new code needed is to set up the palette mapping at startup.
+Since the 4-bit indices are unchanged, existing multicolor code works perfectly. The only new code needed is to set up the palette pointer at startup.
 
-```
+```asm
 ; Example: Set up a custom 16-color palette for a game
-LDX #$00
-setup_loop:
-    STX $D035           ; Select slot X
-    LDA my_palette,X    ; Get Ultimate palette index
-    STA $D036           ; Store mapping
-    INX
-    CPX #$10
-    BNE setup_loop
-    RTS
+LDA #<my_palette
+STA $D031
+LDA #>my_palette
+STA $D032
+LDA #$80          ; Enable extended mode
+STA $D02F
+RTS
 
 my_palette:
     .byte $00, $01, $2F, $3A, $45, $52, $6B, $78  ; Slots 0-7
@@ -271,36 +303,10 @@ my_palette:
 
 ---
 
-### Phase 6: Per-Scanline Palette (Raster Effects)
-
-When EXT_CTRL bit 5 = 1:
-- VIC reads palette mapping from pointer at start of each scanline
-- Allows different 16-color mappings per scanline
-- Each mapping is 16 bytes, pointer table is 200 × 2 bytes = 400 bytes
-
-**Scanline Palette Table Format**:
-```
-$0000: Scanline 0 mapping pointer (low)
-$0001: Scanline 0 mapping pointer (high)
-$0002: Scanline 1 mapping pointer (low)
-$0003: Scanline 1 mapping pointer (high)
-...
-```
-
-**Memory Usage**:
-- Pointer table: 400 bytes
-- If every scanline uses unique mapping: 200 × 16 = 3200 bytes
-- If scanlines share mappings: much less (e.g., 20 unique = 320 bytes)
-
-**Alternative: Raster Interrupt Approach**
-Instead of automatic per-scanline switching, software can use raster interrupts to update the 16-byte mapping at specific scanlines. This uses less memory but more CPU.
-
----
-
 ## Implementation Phases (Emulator)
 
 ### Phase 1: Basic Infrastructure
-1. Add extended register storage ($D02F-$D03F)
+1. Add 4 extended registers ($D02F-$D032, $D03F)
 2. Implement unlock sequence detection ("VICX" to $D03F)
 3. Add EXT_CTRL register handling
 4. Display extension status in emulator UI
@@ -310,23 +316,17 @@ Instead of automatic per-scanline switching, software can use raster interrupts 
 2. This is fixed/read-only - the master color reference
 
 ### Phase 3: Palette Mapping
-1. Add 16-byte mapping table (slot → Ultimate index)
-2. Initialize mapping to 0-15 (standard VIC-II colors)
-3. Implement PAL_INDEX ($D035) and PAL_DATA ($D036) registers
-4. Hook mapping into VIC-II color output stage
+1. Implement PAL_PTR ($D031/$D032) - points to 16-byte table in C64 RAM
+2. Read palette from C64 RAM at PAL_PTR location
+3. Hook into VIC-II color output: slot → RAM[PAL_PTR+slot] → ultimate_palette
 
 ### Phase 4: Video Output Integration
-1. Modify screen color lookup: slot → screen_mapping[slot] → ultimate_palette[index]
-2. Modify sprite color lookup: $D025-$D02E value → ultimate_palette[value] (direct, no mapping)
+1. Modify screen color lookup: slot → RAM[PAL_PTR+slot] → ultimate_palette[index]
+2. Modify sprite color lookup: $D025-$D02E value → ultimate_palette[value] (direct)
 3. All existing VIC-II modes work unchanged (bitmap, multicolor, sprites)
 4. Test with standard software
 
-### Phase 5: Per-Scanline Switching (Optional)
-1. Implement palette pointer registers
-2. Add scanline-triggered mapping reload
-3. Test raster effects
-
-### Phase 6: Validation
+### Phase 5: Validation
 1. Run existing C64 software - must work unchanged
 2. Test palette switching
 3. Use converter tool images as reference
@@ -337,8 +337,8 @@ Instead of automatic per-scanline switching, software can use raster interrupts 
 ## Compatibility Checklist
 
 - [ ] Unlock sequence cannot be triggered by existing software
-- [ ] Unlocked state does not affect standard VIC-II behavior until color mode changed
-- [ ] COLOR_MODE $00 is 100% identical to standard VIC-II
+- [ ] Unlocked state does not affect standard VIC-II behavior until EXT_CTRL bit 7 set
+- [ ] EXT_CTRL = $00 is 100% identical to standard VIC-II
 - [ ] Reading unused registers returns expected values ($FF)
 - [ ] Standard C64 boot sequence works
 - [ ] GEOS, productivity software works
@@ -362,16 +362,435 @@ Instead of automatic per-scanline switching, software can use raster interrupts 
 | Component | Size | Description |
 |-----------|------|-------------|
 | Ultimate Palette | 768 bytes | 256 × RGB (fixed, read-only) |
-| Screen Mapping | 16 bytes | 16 slots → Ultimate index |
-| Sprite Colors | 0 bytes | Uses existing $D025-$D02E (direct index) |
-| Extended Registers | 17 bytes | $D02F-$D03F |
-| **Total** | **~801 bytes** | |
+| Extended Registers | 5 bytes | $D02F-$D032, $D03F |
+| **Total** | **~773 bytes** | |
 
-### In C64 RAM (Optional)
+### In C64 RAM
 | Component | Size | Description |
 |-----------|------|-------------|
-| Per-scanline pointers | 400 bytes | 200 scanlines × 2 bytes (if used) |
-| Palette tables | varies | 16 bytes per unique palette |
+| Palette mapping table | 16 bytes | 16 slots × 1 byte Ultimate index |
+
+---
+
+## Ultimate Palette V8 - Complete 256-Color Reference
+
+The Ultimate Palette is fixed in the emulator/hardware (768 bytes = 256 × RGB). Software selects colors by index (0-255). The first 16 entries match standard VIC-II colors for backward compatibility.
+
+The palette is organized into 8-color ramps (dark → light) by hue, plus special groups.
+
+### Standard C64 Colors (0-15)
+
+| Idx | Color | R | G | B | Hex |
+|-----|-------|---|---|---|-----|
+| 0 | Black | 0 | 0 | 0 | #000000 |
+| 1 | White | 255 | 255 | 255 | #ffffff |
+| 2 | Red | 136 | 57 | 50 | #883932 |
+| 3 | Cyan | 103 | 182 | 189 | #67b6bd |
+| 4 | Purple | 139 | 63 | 150 | #8b3f96 |
+| 5 | Green | 85 | 160 | 73 | #55a049 |
+| 6 | Blue | 64 | 49 | 141 | #40318d |
+| 7 | Yellow | 191 | 206 | 114 | #bfce72 |
+| 8 | Orange | 139 | 84 | 41 | #8b5429 |
+| 9 | Brown | 87 | 66 | 0 | #574200 |
+| 10 | Light Red | 184 | 105 | 98 | #b86962 |
+| 11 | Dark Grey | 80 | 80 | 80 | #505050 |
+| 12 | Medium Grey | 120 | 120 | 120 | #787878 |
+| 13 | Light Green | 148 | 224 | 137 | #94e089 |
+| 14 | Light Blue | 120 | 105 | 196 | #7869c4 |
+| 15 | Light Grey | 159 | 159 | 159 | #9f9f9f |
+
+### Grayscale Ramp (16-31)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 16 | 0 | 0 | 0 | #000000 |
+| 17 | 17 | 17 | 17 | #111111 |
+| 18 | 34 | 34 | 34 | #222222 |
+| 19 | 51 | 51 | 51 | #333333 |
+| 20 | 68 | 68 | 68 | #444444 |
+| 21 | 85 | 85 | 85 | #555555 |
+| 22 | 102 | 102 | 102 | #666666 |
+| 23 | 119 | 119 | 119 | #777777 |
+| 24 | 136 | 136 | 136 | #888888 |
+| 25 | 153 | 153 | 153 | #999999 |
+| 26 | 170 | 170 | 170 | #aaaaaa |
+| 27 | 187 | 187 | 187 | #bbbbbb |
+| 28 | 204 | 204 | 204 | #cccccc |
+| 29 | 221 | 221 | 221 | #dddddd |
+| 30 | 238 | 238 | 238 | #eeeeee |
+| 31 | 255 | 255 | 255 | #ffffff |
+
+### Warm Browns (32-39)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 32 | 59 | 37 | 17 | #3b2511 |
+| 33 | 96 | 62 | 30 | #603e1e |
+| 34 | 132 | 87 | 45 | #84572d |
+| 35 | 167 | 112 | 62 | #a7703e |
+| 36 | 188 | 138 | 91 | #bc8a5b |
+| 37 | 200 | 164 | 130 | #c8a482 |
+| 38 | 214 | 190 | 168 | #d6bea8 |
+| 39 | 229 | 216 | 204 | #e5d8cc |
+
+### Cool Browns (40-47)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 40 | 57 | 35 | 19 | #392313 |
+| 41 | 88 | 55 | 31 | #58371f |
+| 42 | 118 | 76 | 45 | #764c2d |
+| 43 | 146 | 96 | 60 | #92603c |
+| 44 | 174 | 117 | 77 | #ae754d |
+| 45 | 185 | 141 | 109 | #b98d6d |
+| 46 | 197 | 164 | 141 | #c5a48d |
+| 47 | 210 | 188 | 172 | #d2bcac |
+
+### Rust (48-55)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 48 | 61 | 29 | 15 | #3d1d0f |
+| 49 | 82 | 40 | 22 | #522816 |
+| 50 | 103 | 53 | 31 | #67351f |
+| 51 | 122 | 65 | 41 | #7a4129 |
+| 52 | 141 | 78 | 51 | #8d4e33 |
+| 53 | 158 | 92 | 63 | #9e5c3f |
+| 54 | 175 | 105 | 76 | #af694c |
+| 55 | 181 | 123 | 98 | #b57b62 |
+
+### Dark Sienna (56-63)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 56 | 63 | 25 | 13 | #3f190d |
+| 57 | 76 | 32 | 18 | #4c2012 |
+| 58 | 88 | 39 | 23 | #582717 |
+| 59 | 100 | 47 | 30 | #642f1e |
+| 60 | 112 | 55 | 37 | #703725 |
+| 61 | 122 | 63 | 44 | #7a3f2c |
+| 62 | 132 | 72 | 53 | #844835 |
+| 63 | 141 | 81 | 62 | #8d513e |
+
+### Pure Red (64-71)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 64 | 61 | 0 | 0 | #3d0000 |
+| 65 | 115 | 1 | 1 | #730101 |
+| 66 | 168 | 3 | 3 | #a80303 |
+| 67 | 220 | 7 | 7 | #dc0707 |
+| 68 | 245 | 37 | 37 | #f52525 |
+| 69 | 245 | 92 | 92 | #f55c5c |
+| 70 | 247 | 145 | 145 | #f79191 |
+| 71 | 250 | 198 | 198 | #fac6c6 |
+
+### Orange (72-79)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 72 | 61 | 29 | 0 | #3d1d00 |
+| 73 | 115 | 56 | 1 | #733801 |
+| 74 | 168 | 82 | 3 | #a85203 |
+| 75 | 220 | 109 | 7 | #dc6d07 |
+| 76 | 245 | 137 | 37 | #f58925 |
+| 77 | 245 | 165 | 92 | #f5a55c |
+| 78 | 247 | 194 | 145 | #f7c291 |
+| 79 | 250 | 223 | 198 | #fadfc6 |
+
+### Yellow (80-87)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 80 | 61 | 55 | 0 | #3d3700 |
+| 81 | 115 | 103 | 1 | #736701 |
+| 82 | 168 | 151 | 3 | #a89703 |
+| 83 | 220 | 198 | 7 | #dcc607 |
+| 84 | 245 | 224 | 37 | #f5e025 |
+| 85 | 245 | 230 | 92 | #f5e65c |
+| 86 | 247 | 237 | 145 | #f7ed91 |
+| 87 | 250 | 245 | 198 | #faf5c6 |
+
+### Pure Green (88-95)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 88 | 1 | 61 | 0 | #013d00 |
+| 89 | 3 | 115 | 1 | #037301 |
+| 90 | 6 | 168 | 3 | #06a803 |
+| 91 | 11 | 220 | 7 | #0bdc07 |
+| 92 | 41 | 245 | 37 | #29f525 |
+| 93 | 95 | 245 | 92 | #5ff55c |
+| 94 | 147 | 247 | 145 | #93f791 |
+| 95 | 199 | 250 | 198 | #c7fac6 |
+
+### Cyan (96-103)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 96 | 0 | 61 | 61 | #003d3d |
+| 97 | 1 | 115 | 115 | #017373 |
+| 98 | 3 | 168 | 168 | #03a8a8 |
+| 99 | 7 | 220 | 220 | #07dcdc |
+| 100 | 37 | 245 | 245 | #25f5f5 |
+| 101 | 92 | 245 | 245 | #5cf5f5 |
+| 102 | 145 | 247 | 247 | #91f7f7 |
+| 103 | 198 | 250 | 250 | #c6fafa |
+
+### Blue (104-111)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 104 | 0 | 24 | 61 | #00183d |
+| 105 | 1 | 46 | 115 | #012e73 |
+| 106 | 3 | 69 | 168 | #0345a8 |
+| 107 | 7 | 92 | 220 | #075cdc |
+| 108 | 37 | 120 | 245 | #2578f5 |
+| 109 | 92 | 153 | 245 | #5c99f5 |
+| 110 | 145 | 186 | 247 | #91baf7 |
+| 111 | 198 | 219 | 250 | #c6dbfa |
+
+### Violet (112-119)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 112 | 30 | 0 | 61 | #1e003d |
+| 113 | 58 | 1 | 115 | #3a0173 |
+| 114 | 85 | 3 | 168 | #5503a8 |
+| 115 | 113 | 7 | 220 | #7107dc |
+| 116 | 141 | 37 | 245 | #8d25f5 |
+| 117 | 169 | 92 | 245 | #a95cf5 |
+| 118 | 196 | 145 | 247 | #c491f7 |
+| 119 | 224 | 198 | 250 | #e0c6fa |
+
+### Magenta (120-127)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 120 | 61 | 0 | 36 | #3d0024 |
+| 121 | 115 | 1 | 69 | #730145 |
+| 122 | 168 | 3 | 102 | #a80366 |
+| 123 | 220 | 7 | 134 | #dc0786 |
+| 124 | 245 | 37 | 162 | #f525a2 |
+| 125 | 245 | 92 | 184 | #f55cb8 |
+| 126 | 247 | 145 | 206 | #f791ce |
+| 127 | 250 | 198 | 229 | #fac6e5 |
+
+### Muted Red (128-135)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 128 | 68 | 33 | 33 | #442121 |
+| 129 | 98 | 47 | 47 | #622f2f |
+| 130 | 127 | 61 | 61 | #7f3d3d |
+| 131 | 157 | 75 | 75 | #9d4b4b |
+| 132 | 179 | 97 | 97 | #b36161 |
+| 133 | 193 | 127 | 127 | #c17f7f |
+| 134 | 207 | 156 | 156 | #cf9c9c |
+| 135 | 221 | 186 | 186 | #ddbaba |
+
+### Muted Orange (136-143)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 136 | 68 | 50 | 33 | #443221 |
+| 137 | 98 | 71 | 47 | #62472f |
+| 138 | 127 | 93 | 61 | #7f5d3d |
+| 139 | 157 | 114 | 75 | #9d724b |
+| 140 | 179 | 136 | 97 | #b38861 |
+| 141 | 193 | 158 | 127 | #c19e7f |
+| 142 | 207 | 181 | 156 | #cfb59c |
+| 143 | 221 | 203 | 186 | #ddcbba |
+
+### Muted Yellow (144-151)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 144 | 68 | 65 | 33 | #444121 |
+| 145 | 98 | 93 | 47 | #625d2f |
+| 146 | 127 | 121 | 61 | #7f793d |
+| 147 | 157 | 149 | 75 | #9d954b |
+| 148 | 179 | 171 | 97 | #b3ab61 |
+| 149 | 193 | 186 | 127 | #c1ba7f |
+| 150 | 207 | 202 | 156 | #cfca9c |
+| 151 | 221 | 218 | 186 | #dddaba |
+
+### Muted Green (152-159)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 152 | 33 | 68 | 33 | #214421 |
+| 153 | 48 | 98 | 47 | #30622f |
+| 154 | 62 | 127 | 61 | #3e7f3d |
+| 155 | 77 | 157 | 75 | #4d9d4b |
+| 156 | 99 | 179 | 97 | #63b361 |
+| 157 | 128 | 193 | 127 | #80c17f |
+| 158 | 157 | 207 | 156 | #9dcf9c |
+| 159 | 186 | 221 | 186 | #baddba |
+
+### Muted Blue (160-167)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 160 | 33 | 47 | 68 | #212f44 |
+| 161 | 47 | 67 | 98 | #2f4362 |
+| 162 | 61 | 88 | 127 | #3d587f |
+| 163 | 75 | 108 | 157 | #4b6c9d |
+| 164 | 97 | 130 | 179 | #6182b3 |
+| 165 | 127 | 153 | 193 | #7f99c1 |
+| 166 | 156 | 177 | 207 | #9cb1cf |
+| 167 | 186 | 200 | 221 | #bac8dd |
+
+### Muted Purple (168-175)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 168 | 50 | 33 | 68 | #322144 |
+| 169 | 72 | 47 | 98 | #482f62 |
+| 170 | 94 | 61 | 127 | #5e3d7f |
+| 171 | 116 | 75 | 157 | #744b9d |
+| 172 | 138 | 97 | 179 | #8a61b3 |
+| 173 | 160 | 127 | 193 | #a07fc1 |
+| 174 | 182 | 156 | 207 | #b69ccf |
+| 175 | 203 | 186 | 221 | #cbbadd |
+
+### Blue-Grey (176-183)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 176 | 30 | 38 | 45 | #1e262d |
+| 177 | 51 | 64 | 76 | #33404c |
+| 178 | 71 | 89 | 107 | #47596b |
+| 179 | 91 | 115 | 137 | #5b7389 |
+| 180 | 117 | 141 | 163 | #758da3 |
+| 181 | 147 | 166 | 183 | #93a6b7 |
+| 182 | 178 | 191 | 203 | #b2bfcb |
+| 183 | 209 | 217 | 224 | #d1d9e0 |
+
+### Steel Blue (184-191)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 184 | 24 | 38 | 51 | #182633 |
+| 185 | 41 | 64 | 86 | #294056 |
+| 186 | 58 | 90 | 120 | #3a5a78 |
+| 187 | 74 | 116 | 154 | #4a749a |
+| 188 | 100 | 141 | 180 | #648db4 |
+| 189 | 134 | 166 | 196 | #86a6c4 |
+| 190 | 168 | 192 | 213 | #a8c0d5 |
+| 191 | 203 | 217 | 230 | #cbd9e6 |
+
+### Teal-Grey (192-199)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 192 | 30 | 45 | 45 | #1e2d2d |
+| 193 | 51 | 76 | 76 | #334c4c |
+| 194 | 71 | 107 | 107 | #476b6b |
+| 195 | 91 | 137 | 137 | #5b8989 |
+| 196 | 117 | 163 | 163 | #75a3a3 |
+| 197 | 147 | 183 | 183 | #93b7b7 |
+| 198 | 178 | 203 | 203 | #b2cbcb |
+| 199 | 209 | 224 | 224 | #d1e0e0 |
+
+### Deep Teal (200-207)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 200 | 24 | 51 | 51 | #183333 |
+| 201 | 41 | 86 | 86 | #295656 |
+| 202 | 58 | 120 | 120 | #3a7878 |
+| 203 | 74 | 154 | 154 | #4a9a9a |
+| 204 | 100 | 180 | 180 | #64b4b4 |
+| 205 | 134 | 196 | 196 | #86c4c4 |
+| 206 | 168 | 213 | 213 | #a8d5d5 |
+| 207 | 203 | 230 | 230 | #cbe6e6 |
+
+### Gold / Amber (208-215)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 208 | 68 | 51 | 5 | #443305 |
+| 209 | 114 | 84 | 10 | #72540a |
+| 210 | 159 | 117 | 17 | #9f7511 |
+| 211 | 204 | 148 | 26 | #cc941a |
+| 212 | 230 | 171 | 47 | #e6ab2f |
+| 213 | 241 | 188 | 79 | #f1bc4f |
+| 214 | 254 | 206 | 109 | #fece6d |
+| 215 | 255 | 225 | 138 | #ffe18a |
+
+### Cool Grey (216-223)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 216 | 40 | 40 | 50 | #282832 |
+| 217 | 68 | 68 | 78 | #44444e |
+| 218 | 97 | 97 | 107 | #61616b |
+| 219 | 125 | 125 | 135 | #7d7d87 |
+| 220 | 154 | 154 | 164 | #9a9aa4 |
+| 221 | 182 | 182 | 192 | #b6b6c0 |
+| 222 | 211 | 211 | 221 | #d3d3dd |
+| 223 | 240 | 240 | 250 | #f0f0fa |
+
+### Earth Brown (224-231)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 224 | 38 | 23 | 12 | #26170c |
+| 225 | 68 | 41 | 22 | #442916 |
+| 226 | 98 | 60 | 32 | #623c20 |
+| 227 | 128 | 78 | 42 | #804e2a |
+| 228 | 158 | 97 | 52 | #9e6134 |
+| 229 | 188 | 115 | 62 | #bc733e |
+| 230 | 200 | 136 | 91 | #c8885b |
+| 231 | 210 | 158 | 121 | #d29e79 |
+
+### Natural Green (232-239)
+
+| Idx | R | G | B | Hex |
+|-----|---|---|---|-----|
+| 232 | 21 | 36 | 14 | #15240e |
+| 233 | 36 | 63 | 24 | #243f18 |
+| 234 | 51 | 89 | 34 | #335922 |
+| 235 | 67 | 116 | 44 | #43742c |
+| 236 | 82 | 142 | 54 | #528e36 |
+| 237 | 97 | 169 | 64 | #61a940 |
+| 238 | 115 | 188 | 80 | #73bc50 |
+| 239 | 136 | 198 | 107 | #88c66b |
+
+### Near-Black Shades (240-255)
+
+| Idx | Group | R | G | B | Hex |
+|-----|-------|---|---|---|-----|
+| 240 | Dark Red | 16 | 0 | 0 | #100000 |
+| 241 | Dark Red | 24 | 4 | 4 | #180404 |
+| 242 | Dark Red | 32 | 8 | 8 | #200808 |
+| 243 | Dark Red | 40 | 12 | 12 | #280c0c |
+| 244 | Dark Blue | 0 | 0 | 16 | #000010 |
+| 245 | Dark Blue | 4 | 4 | 24 | #040418 |
+| 246 | Dark Blue | 8 | 8 | 32 | #080820 |
+| 247 | Dark Blue | 12 | 12 | 40 | #0c0c28 |
+| 248 | Dark Yellow | 8 | 8 | 0 | #080800 |
+| 249 | Dark Yellow | 16 | 16 | 4 | #101004 |
+| 250 | Dark Yellow | 24 | 20 | 8 | #181408 |
+| 251 | Dark Yellow | 32 | 28 | 12 | #201c0c |
+| 252 | Dark Teal | 4 | 8 | 10 | #04080a |
+| 253 | Dark Teal | 8 | 16 | 20 | #081014 |
+| 254 | Dark Teal | 12 | 24 | 28 | #0c181c |
+| 255 | Dark Teal | 16 | 32 | 36 | #102024 |
+
+### Palette Organization Summary
+
+| Index Range | Group | Description |
+|-------------|-------|-------------|
+| 0-15 | C64 Standard | Original VIC-II colors (backward compatible) |
+| 16-31 | Grayscale | 16-step pure grey ramp |
+| 32-63 | Browns | 4 ramps: warm, cool, rust, sienna |
+| 64-127 | Pure Hues | 8 ramps: red, orange, yellow, green, cyan, blue, violet, magenta |
+| 128-175 | Muted Hues | 6 ramps: red, orange, yellow, green, blue, purple (desaturated) |
+| 176-207 | Cool Tones | 4 ramps: blue-grey, steel blue, teal-grey, deep teal |
+| 208-239 | Specialty | Gold/amber, cool grey, earth brown, natural green |
+| 240-255 | Near-Black | 4 groups of 4: dark red, dark blue, dark yellow, dark teal |
 
 ---
 
