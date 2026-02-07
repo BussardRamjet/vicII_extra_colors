@@ -69,15 +69,41 @@ LDA #$43        ; 'C'
 STA $D03F
 LDA #$58        ; 'X'
 STA $D03F
-; Extended mode now active
+; EXT_CTRL automatically set to $80 (registers accessible, palette off)
 ```
 
-**Deactivation:**
+**Disable palette mapping (keep registers accessible):**
 ```asm
-; Disable extended mode (return to standard VIC-II)
-LDA #$00
-STA $D02F       ; Clear EXT_CTRL
+LDA #$80
+STA $D02F       ; Palette mapping off, registers still accessible
 ```
+
+**Re-lock (return to original hardware behavior):**
+```asm
+LDA #$00
+STA $D02F       ; Bit 7 = 0 → re-locks registers, back to standard VIC-II
+```
+
+#### State Machine Behavior
+- The unlock sequence is tracked by an internal 2-bit counter
+- Each correct byte advances the counter: V(0) → I(1) → C(2) → X(3=unlock)
+- **Any incorrect write to $D03F resets the counter to 0**
+- Writes to other VIC registers do NOT affect the counter
+- On successful unlock, EXT_CTRL is automatically set to $80 (registers on, palette off)
+
+#### Re-lock Behavior
+- Writing any value with bit 7 = 0 to EXT_CTRL re-locks the extension
+- All registers return to reading $FF (identical to original hardware)
+- The unlock sequence must be performed again to regain access
+- No special sequence needed — just clear bit 7
+
+#### Reset Behavior
+On hardware/software reset:
+- Unlock state clears (registers locked)
+- EXT_CTRL resets to $00
+- PAL_PTR resets to $0000
+- EXT_STATUS reflects disabled state
+- VIC-II operates in standard mode, identical to original hardware
 
 **Why This Approach:**
 - No existing software writes "VICX" to $D03F
@@ -85,6 +111,8 @@ STA $D02F       ; Clear EXT_CTRL
 - Easy to implement in hardware (FPGA)
 - Different from Kawari's "VIC2" to avoid conflicts
 - Proven approach used by VIC-II Kawari
+- Incorrect writes reset the counter, preventing accidental unlock
+- Re-lock is simple (just clear bit 7) — no reverse sequence needed
 
 ---
 
@@ -99,9 +127,31 @@ Once unlocked, only **4 new registers** are needed:
 | $D031 | PAL_PTR_LO | R/W | Palette pointer low byte (VIC bank-relative) |
 | $D032 | PAL_PTR_HI | R/W | Palette pointer high byte (bits 5-0 used, 14-bit) |
 | $D033-$D03E | Reserved | - | Future expansion |
-| $D03F | EXT_LOCK | W | Lock/unlock register |
+| $D03F | EXT_LOCK | W | Lock/unlock register (state machine) |
 
 **Palette data lives in C64 RAM within the current VIC bank** - just modify memory directly!
+
+#### Register Read Behavior
+
+| State | $D02F | $D030 | $D031-$D032 | $D033-$D03E | $D03F |
+|-------|-------|-------|-------------|-------------|-------|
+| Locked (default) | $FF | $FF | $FF | $FF | $FF |
+| Unlocked | R/W | Status | R/W | $FF | W only |
+
+- **Before unlock**: all extended registers read as $FF (identical to original hardware)
+- **After unlock**: EXT_CTRL, EXT_STATUS, and PAL_PTR all become readable
+- **PAL_PTR reads return the last written value** when unlocked (useful for software to verify configuration)
+- **After re-lock (write bit 7=0 to EXT_CTRL)**: all registers return to reading $FF
+
+#### EXT_STATUS ($D030) Format
+```
+Bit 7: Palette mapping active (1=mapping enabled, mirrors EXT_CTRL bit 6)
+Bit 6: Extension unlocked (1=registers accessible, mirrors EXT_CTRL bit 7)
+Bits 5-0: Version number (currently %000000 = version 0)
+```
+- Returns $FF when locked (indistinguishable from original hardware)
+- When unlocked: reflects current state and version
+- Software can read this to detect extension presence after unlock
 
 #### VIC Bank-Relative Addressing
 
@@ -123,13 +173,49 @@ VIC Bank selection via CIA2 ($DD00 bits 1-0):
 - Simpler hardware implementation (reuses existing 14-bit address bus)
 - Matches mental model of existing VIC programming
 
+#### Character ROM Shadow Warning
+In VIC banks 0 and 2, offsets $1000-$1FFF are shadowed by character ROM — the VIC reads character ROM instead of RAM at these addresses. This is a standard VIC-II behavior that applies to **all** VIC data fetches, including the palette mapping table.
+
+**Do NOT place the palette table at these offsets:**
+- Bank 0: $1000-$1FFF (absolute $1000-$1FFF)
+- Bank 2: $1000-$1FFF (absolute $9000-$9FFF)
+
+Banks 1 and 3 are unaffected and have no character ROM shadow.
+
+#### VIC Bank Switching
+If the program switches the VIC bank (via CIA2 $DD00), the PAL_PTR offset now refers to a different physical address. Software must either:
+- Keep a copy of the palette data at the same offset in every VIC bank used, or
+- Update PAL_PTR after switching banks
+
+This is the same consideration that applies to screen RAM and character data placement.
+
+#### Register Mirroring
+Standard VIC-II registers mirror every 64 bytes throughout the $D000-$D3FF range ($D000 = $D040 = $D080...). Extended registers follow the same mirroring behavior:
+- $D03F = $D07F = $D0BF = $D0FF = ... (unlock/lock register)
+- $D02F = $D06F = $D0AF = ... (EXT_CTRL)
+- etc.
+
+This maintains consistency with existing VIC-II behavior. The unlock sequence works at any mirrored address.
+
 #### EXT_CTRL ($D02F) Bit Layout
 ```
-Bit 7: Extended mode enable (1=enabled, 0=disabled)
-Bits 6-0: Reserved (0)
+Bit 7: Extension enable (1=registers unlocked, write 0 to re-lock)
+Bit 6: Palette mapping active (1=use mapping table, 0=standard VIC-II colors)
+Bits 5-0: Reserved (0)
 ```
 
-When bit 7 is set, PAL_PTR points to a 16-byte palette mapping table in RAM.
+| Value | State | Description |
+|-------|-------|-------------|
+| `$C0` | Fully active | Registers accessible, palette mapping enabled |
+| `$80` | Setup mode | Registers accessible, standard VIC-II colors |
+| `$00` | Locked | Registers return $FF, standard VIC-II (write 0 to bit 7 to re-lock) |
+
+**Typical workflow:**
+1. VICX unlock → EXT_CTRL automatically set to `$80`
+2. Configure PAL_PTR and palette data in RAM
+3. Write `$C0` to enable palette mapping
+4. Write `$80` to temporarily disable mapping (e.g., reconfigure palette)
+5. Write `$00` to fully re-lock (must VICX unlock again to access registers)
 
 #### How Screen Palette Mapping Works
 ```asm
@@ -140,8 +226,8 @@ STA $D031       ; Low byte
 LDA #$30
 STA $D032       ; High byte (bits 5-0 = $30)
 
-; Enable extended mode
-LDA #$80
+; Enable palette mapping
+LDA #$C0
 STA $D02F
 
 ; Modify palette directly in RAM
@@ -167,40 +253,56 @@ LDA #$08
 STA $D032
 ```
 
-#### How Sprite Colors Work in Extended Mode
-Sprites only use 3 colors max (plus transparent), so no mapping table needed!
+#### Color Register Behavior in Extended Mode
 
-**Existing sprite color registers:**
-| Address | Standard Mode | Extended Mode |
-|---------|---------------|---------------|
-| $D025 | Sprite Multicolor 0 (bits 3-0 = color 0-15) | Full 8-bit Ultimate index |
-| $D026 | Sprite Multicolor 1 (bits 3-0 = color 0-15) | Full 8-bit Ultimate index |
-| $D027-$D02E | Sprite 0-7 color (bits 3-0 = color 0-15) | Full 8-bit Ultimate index |
+There are two categories of color registers, each handled differently:
 
-The upper 4 bits of $D020-$D02E are unused on real hardware (read as 1). In extended mode, all 8 bits become active.
+**Mapped registers (4-bit slot → palette mapping table):**
+These registers use their lower 4 bits as a slot index into the 16-byte palette mapping table, just like screen RAM and color RAM.
+
+| Address | Purpose | Extended behavior |
+|---------|---------|-------------------|
+| $D020 | Border color | Bits 3-0 → palette mapping → Ultimate color |
+| $D021 | Background color 0 | Bits 3-0 → palette mapping → Ultimate color |
+| $D022 | Background color 1 (multicolor/ECM) | Bits 3-0 → palette mapping → Ultimate color |
+| $D023 | Background color 2 (ECM) | Bits 3-0 → palette mapping → Ultimate color |
+| $D024 | Background color 3 (ECM) | Bits 3-0 → palette mapping → Ultimate color |
+
+**Direct registers (full 8-bit Ultimate palette index):**
+Sprite color registers bypass the mapping table entirely. The full 8-bit value is used as a direct index into the 256-color Ultimate palette.
+
+| Address | Purpose | Extended behavior |
+|---------|---------|-------------------|
+| $D025 | Sprite multicolor 0 (shared) | Full 8-bit → Ultimate palette direct |
+| $D026 | Sprite multicolor 1 (shared) | Full 8-bit → Ultimate palette direct |
+| $D027-$D02E | Sprite 0-7 individual colors | Full 8-bit → Ultimate palette direct |
+
+The upper 4 bits of $D025-$D02E are unused on real hardware (read as 1). In extended mode, all 8 bits become active for sprite registers only.
+
+**Why the asymmetry?**
+- Border and background registers are interleaved with screen/color RAM lookups in the VIC-II pipeline — they share the same 4-bit slot system, so they naturally go through the mapping table
+- Sprites are rendered independently and only use 3 colors each (plus transparent), so direct 8-bit indexing gives them access to the full palette without needing a separate mapping table
+- This means sprites can use colors outside the current 16-slot mapping — useful for UI overlays, cursors, etc.
 
 ```asm
-; Set sprite 0 color to Ultimate palette index #200
+; Sprite 0: direct Ultimate palette index #200
 LDA #$C8
 STA $D027
 
-; Set shared multicolor 0 to Ultimate palette index #47
+; Sprite multicolor 0: direct Ultimate palette index #47
 LDA #$2F
 STA $D025
+
+; Border: uses slot 0 from mapping table (whatever slot 0 maps to)
+LDA #$00
+STA $D020
+
+; Background: uses slot 6 from mapping table
+LDA #$06
+STA $D021
 ```
 
-**No new registers needed for border or sprites!** Just write the Ultimate index directly to existing registers.
-
-#### Summary: Direct 8-bit Color Registers (Extended Mode)
-These existing VIC-II registers use full 8-bit Ultimate palette index in extended mode:
-
-| Address | Purpose |
-|---------|---------|
-| $D025 | Sprite multicolor 0 (shared) |
-| $D026 | Sprite multicolor 1 (shared) |
-| $D027-$D02E | Sprite 0-7 individual colors |
-
-Note: The multicolor cell rules (4×1 vs 4×8, per-scanline vs global bg) are software conventions, not hardware modes. The VIC-II hardware constraints remain the same.
+Note: The multicolor cell rules (4x1 vs 4x8, per-scanline vs global bg) are software conventions, not hardware modes. The VIC-II hardware constraints remain the same.
 
 ---
 
@@ -292,7 +394,7 @@ LDA #<my_palette
 STA $D031
 LDA #>my_palette
 STA $D032
-LDA #$80          ; Enable extended mode
+LDA #$C0          ; Enable palette mapping
 STA $D02F
 RTS
 
@@ -303,13 +405,76 @@ my_palette:
 
 ---
 
+### Phase 6: All VIC-II Modes
+
+The palette mapping applies identically across **all** VIC-II display modes. The mapping is always the final step — it replaces the standard color lookup without changing any mode-specific logic.
+
+#### Standard Character Mode (High-Resolution)
+```
+Foreground: upper nibble screen RAM → Slot 0-15 → Mapped Ultimate color
+Background: $D021                   → Slot 0-15 → Mapped Ultimate color
+```
+
+#### Multicolor Character Mode
+```
+%00 = Background ($D021)       → Slot 0-15 → Mapped Ultimate color
+%01 = Upper nibble screen RAM  → Slot 0-15 → Mapped Ultimate color
+%10 = Lower nibble screen RAM  → Slot 0-15 → Mapped Ultimate color
+%11 = Color RAM                → Slot 0-15 → Mapped Ultimate color
+```
+
+#### Standard Bitmap Mode (High-Resolution)
+```
+Foreground: upper nibble screen RAM → Slot 0-15 → Mapped Ultimate color
+Background: lower nibble screen RAM → Slot 0-15 → Mapped Ultimate color
+```
+
+#### Multicolor Bitmap Mode
+```
+%00 = Background ($D021)       → Slot 0-15 → Mapped Ultimate color
+%01 = Upper nibble screen RAM  → Slot 0-15 → Mapped Ultimate color
+%10 = Lower nibble screen RAM  → Slot 0-15 → Mapped Ultimate color
+%11 = Color RAM                → Slot 0-15 → Mapped Ultimate color
+```
+
+#### Extended Color Mode (ECM)
+```
+Character color: upper nibble screen RAM → Slot 0-15 → Mapped Ultimate color
+Background: selected by upper 2 bits of character code:
+  %00 → $D021 → Slot 0-15 → Mapped Ultimate color
+  %01 → $D022 → Slot 0-15 → Mapped Ultimate color
+  %10 → $D023 → Slot 0-15 → Mapped Ultimate color
+  %11 → $D024 → Slot 0-15 → Mapped Ultimate color
+```
+
+#### Sprites
+```
+Sprite individual color ($D027-$D02E) → Direct 8-bit Ultimate index
+Sprite multicolor 0 ($D025)          → Direct 8-bit Ultimate index
+Sprite multicolor 1 ($D026)          → Direct 8-bit Ultimate index
+Sprite-background priority/collision: unchanged
+```
+
+#### Border
+```
+Border color ($D020) → Slot 0-15 → Mapped Ultimate color
+```
+
+**Key principle:** All 4-bit color sources go through the mapping table. Only sprite color registers use direct 8-bit indexing.
+
+---
+
 ## Implementation Phases (Emulator)
 
 ### Phase 1: Basic Infrastructure
 1. Add 4 extended registers ($D02F-$D032, $D03F)
-2. Implement unlock sequence detection ("VICX" to $D03F)
-3. Add EXT_CTRL register handling
-4. Display extension status in emulator UI
+2. Implement unlock state machine ("VICX" to $D03F, reset on incorrect byte)
+3. Implement re-lock via EXT_CTRL bit 7 (write 0 to re-lock)
+4. Auto-set EXT_CTRL to $80 on successful unlock
+5. Add EXT_CTRL and EXT_STATUS register handling
+6. Implement register read behavior (locked=$FF, unlocked=values)
+7. Handle register mirroring (every 64 bytes)
+8. Handle reset (all state cleared, return to standard mode)
 
 ### Phase 2: Ultimate Palette
 1. Embed 256-color Ultimate palette (V8) as RGB lookup table
@@ -317,42 +482,55 @@ my_palette:
 
 ### Phase 3: Palette Mapping
 1. Implement PAL_PTR ($D031/$D032) - points to 16-byte table in C64 RAM
-2. Read palette from C64 RAM at PAL_PTR location
+2. Read palette from C64 RAM at PAL_PTR location (respecting VIC bank + char ROM shadow)
 3. Hook into VIC-II color output: slot → RAM[PAL_PTR+slot] → ultimate_palette
 
 ### Phase 4: Video Output Integration
-1. Modify screen color lookup: slot → RAM[PAL_PTR+slot] → ultimate_palette[index]
-2. Modify sprite color lookup: $D025-$D02E value → ultimate_palette[value] (direct)
-3. All existing VIC-II modes work unchanged (bitmap, multicolor, sprites)
-4. Test with standard software
+1. Modify mapped color lookup (border, background, screen/color RAM): slot → mapping → Ultimate
+2. Modify sprite color lookup: $D025-$D02E value → ultimate_palette[value] (direct 8-bit)
+3. Verify all VIC-II modes: standard, multicolor, bitmap, multicolor bitmap, ECM
+4. Test with standard software (must be identical when extended mode disabled)
 
 ### Phase 5: Validation
 1. Run existing C64 software - must work unchanged
-2. Test palette switching
-3. Use converter tool images as reference
-4. Performance optimization
+2. Test palette switching across all display modes
+3. Test sprite colors (direct 8-bit) alongside mapped screen colors
+4. Test VIC bank switching with palette data
+5. Test unlock (VICX), re-lock (clear bit 7), and state transitions ($80 ↔ $C0)
+6. Use converter tool images as reference
+7. Performance optimization
 
 ---
 
 ## Compatibility Checklist
 
 - [ ] Unlock sequence cannot be triggered by existing software
+- [ ] Incorrect writes to $D03F reset the unlock state machine
 - [ ] Unlocked state does not affect standard VIC-II behavior until EXT_CTRL bit 7 set
 - [ ] EXT_CTRL = $00 is 100% identical to standard VIC-II
-- [ ] Reading unused registers returns expected values ($FF)
+- [ ] All extended registers read as $FF when locked
+- [ ] Register mirroring works correctly (every 64 bytes)
+- [ ] Hardware/software reset clears all extended state
+- [ ] PAL_PTR in character ROM shadow range ($1000-$1FFF in banks 0/2) handled correctly
+- [ ] VIC bank switching updates palette source address correctly
 - [ ] Standard C64 boot sequence works
 - [ ] GEOS, productivity software works
 - [ ] Games work (test suite needed)
 - [ ] Demos work (especially those using VIC tricks)
+- [ ] All display modes work: standard, multicolor, bitmap, MCM bitmap, ECM
+- [ ] Sprite direct 8-bit colors work independently of mapping table
 
 ---
 
 ## Test Software Requirements
 
-1. **Palette loader**: Load 256-color palette from file
-2. **Mode switcher**: Toggle between standard and extended modes
-3. **Image viewer**: Display converted images
-4. **Validation tool**: Compare emulator output with converter output
+1. **Register test**: Verify VICX unlock, re-lock (bit 7=0), state transitions ($80/$C0), register read behavior ($FF when locked, values when unlocked), EXT_STATUS format
+2. **Palette test**: Load palette, verify mapping across all display modes (standard, multicolor, bitmap, ECM)
+3. **Sprite test**: Verify direct 8-bit sprite colors work independently of mapping table
+4. **Bank switching test**: Verify palette follows VIC bank, char ROM shadow avoidance
+5. **Compatibility test**: Run standard C64 software with extension inactive
+6. **Image viewer**: Display converted images using extended palette
+7. **Validation tool**: Compare emulator output with converter output
 
 ---
 
@@ -363,7 +541,8 @@ my_palette:
 |-----------|------|-------------|
 | Ultimate Palette | 768 bytes | 256 × RGB (fixed, read-only) |
 | Extended Registers | 5 bytes | $D02F-$D032, $D03F |
-| **Total** | **~773 bytes** | |
+| Unlock state machine | 1 byte | 2-bit counter + locked/unlocked flag |
+| **Total** | **~774 bytes** | |
 
 ### In C64 RAM
 | Component | Size | Description |
